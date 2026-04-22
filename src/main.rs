@@ -1,4 +1,3 @@
-use clap::Parser;
 use colored::*;
 use crossterm::{
     cursor,
@@ -8,149 +7,27 @@ use crossterm::{
 };
 use futures::future::join_all;
 use reqwest::Client;
-use std::{fs, io::{self, BufRead, IsTerminal, Write}, path::PathBuf, sync::atomic::{AtomicBool, Ordering}, time::Duration};
+use std::{
+    fs,
+    io::{self, BufRead, IsTerminal, Write},
+    path::PathBuf,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
-use std::sync::Arc;
+mod cli;
+mod config;
+mod model;
+mod utils;
 
-#[derive(Parser)]
-#[command(name = "dott", version, about = "private domain search. no middlemen.")]
-struct Cli {
-    name: Option<String>,
-    #[arg(short, long)]
-    tlds: Option<String>,
-    #[arg(short, long, num_args = 1..)]
-    suggest: Option<Vec<String>>,
-    #[arg(long)]
-    plain: bool,
-    #[arg(long, value_name = "DOMAIN")]
-    watch: Option<String>,
-    #[arg(long, value_name = "DOMAIN")]
-    unwatch: Option<String>,
-    #[arg(long)]
-    watching: bool,
-    #[arg(long, hide = true)]
-    background_check: bool,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-struct WatchEntry {
-    domain: String,
-    last_status: String,
-}
-
-#[derive(Debug, Clone, Default)]
-struct DomainDates {
-    registered: Option<String>,
-    updated:    Option<String>,
-    expires:    Option<String>,
-}
-
-#[derive(Debug, Clone)]
-enum Availability {
-    Available,
-    Protected,
-    Taken(DomainDates),
-    Unknown,
-}
-
-impl Availability {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Availability::Available => "available",
-            Availability::Protected => "protected",
-            Availability::Taken(_)  => "taken",
-            Availability::Unknown   => "unknown",
-        }
-    }
-}
-
-// find the first YYYY-MM-DD pattern in a string
-fn parse_date(s: &str) -> Option<String> {
-    let b = s.as_bytes();
-    for i in 0..b.len().saturating_sub(9) {
-        if b[i..i+4].iter().all(|c| c.is_ascii_digit())
-            && b[i+4] == b'-'
-            && b[i+5..i+7].iter().all(|c| c.is_ascii_digit())
-            && b[i+7] == b'-'
-            && b[i+8..i+10].iter().all(|c| c.is_ascii_digit())
-        {
-            return Some(s[i..i+10].to_string());
-        }
-    }
-    None
-}
-
-const ALL_TLDS: &[&str] = &[
-    "com", "net", "org", "io", "dev", "app", "co", "ai", "me",
-    "so", "gg", "cc", "cv", "xyz",
-];
-
-fn tld_rank(domain: &str) -> u8 {
-    let tld = domain.rsplit('.').next().unwrap_or("");
-    match tld {
-        "com" => 0, "io"  => 1, "dev" => 2, "ai"  => 3,
-        "app" => 4, "co"  => 5, "net" => 6, "org" => 7,
-        "me"  => 8, "so"  => 9, "gg"  => 10, "cc" => 11,
-        "xyz" => 12, "cv" => 13, _ => 99,
-    }
-}
-
-// short names in these TLDs are almost always registrar-priced as premium (e.g. go.ai = $20k+).
-// heuristic only — RDAP/WHOIS will still say "available", but checkout will hit the user with a surprise.
-fn is_likely_premium(domain: &str) -> bool {
-    let Some((name, tld)) = domain.rsplit_once('.') else { return false };
-    name.len() <= 4 && matches!(tld, "ai" | "io" | "app" | "dev" | "co")
-}
-
-fn tld_price(tld: &str) -> Option<&'static str> {
-    // Registration prices from Porkbun, April 2026
-    match tld {
-        "com" => Some("$11.08"), "net" => Some("$12.52"), "org" => Some("$10.74"),
-        "io"  => Some("$51.80"), "dev" => Some("$12.87"), "app" => Some("$14.93"),
-        "co"  => Some("$25.03"), "ai"  => Some("$82.70"), "me"  => Some("$17.27"),
-        "so"  => Some("€55.22"), "gg"  => Some("$51.80"), "cc"  => Some("$8.55"),
-        "xyz" => Some("$12.98"), "cv"  => Some("$8.03"),
-        _ => None,
-    }
-}
-
-fn rdap_url(name: &str, tld: &str) -> Option<String> {
-    match tld {
-        "com"      => Some(format!("https://rdap.verisign.com/com/v1/domain/{}.{}", name, tld)),
-        "net"      => Some(format!("https://rdap.verisign.com/net/v1/domain/{}.{}", name, tld)),
-        "org"      => Some(format!("https://rdap.publicinterestregistry.org/rdap/domain/{}.{}", name, tld)),
-        "io"       => Some(format!("https://rdap.identitydigital.services/rdap/domain/{}.{}", name, tld)),
-        "dev"      => Some(format!("https://pubapi.registry.google/rdap/domain/{}.{}", name, tld)),
-        "app"      => Some(format!("https://pubapi.registry.google/rdap/domain/{}.{}", name, tld)),
-        "ai"       => Some(format!("https://rdap.identitydigital.services/rdap/domain/{}.{}", name, tld)),
-        "me"       => Some(format!("https://rdap.identitydigital.services/rdap/domain/{}.{}", name, tld)),
-        "cc"       => Some(format!("https://tld-rdap.verisign.com/cc/v1/domain/{}.{}", name, tld)),
-        "xyz"      => Some(format!("https://rdap.centralnic.com/xyz/domain/{}.{}", name, tld)),
-        "cv"       => Some(format!("https://rdap.nic.cv/domain/{}.{}", name, tld)),
-        "gg"       => None, // rdap.gg returns HTML — use WHOIS only
-        _          => Some(format!("https://rdap.org/domain/{}.{}", name, tld)),
-    }
-}
-
-fn whois_server(tld: &str) -> Option<&'static str> {
-    match tld {
-        // only list servers confirmed working — dead servers cause 4s timeouts
-        "com"      => Some("whois.verisign-grs.com"),
-        "net"      => Some("whois.verisign-grs.com"),
-        "org"      => Some("whois.pir.org"),
-        "io"       => Some("whois.nic.io"),
-        "co"       => Some("whois.registry.co"),
-        "ai"       => Some("whois.nic.ai"),
-        "me"       => Some("whois.nic.me"),
-        "so"       => Some("whois.nic.so"),
-        "cc"       => Some("whois.nic.cc"),
-        "xyz"      => Some("whois.nic.xyz"),
-        "gg"       => Some("whois.gg"),
-        _          => None,
-    }
-}
+use clap::Parser;
+use cli::Cli;
+use config::{ALL_TLDS, is_likely_premium, rdap_url, tld_price, tld_rank, whois_server};
+use model::{Availability, DomainDates, WatchEntry};
+use utils::{days_until, parse_date, parse_prose_date};
 
 async fn whois_check(name: &str, tld: &str) -> Availability {
     let server = match whois_server(tld) {
@@ -194,7 +71,31 @@ async fn whois_check(name: &str, tld: &str) -> Availability {
     ).await;
 
     let lower = response.to_lowercase();
-    if lower.contains("no match")
+    // check Taken first: CentralNic's .co footer contains the word "available"
+    // in boilerplate, which otherwise tripped the Available heuristic.
+    if lower.contains("domain name:") || lower.contains("domain:") {
+        let dates = if tld == "gg" {
+            // whois.gg is "registered until cancelled" — no expiry published.
+            // registration date is prose: "Registered on 26th February 2015".
+            let registered = response.lines()
+                .find(|l| l.to_lowercase().contains("registered on"))
+                .and_then(parse_prose_date);
+            DomainDates { registered, updated: None, expires: None }
+        } else {
+            let extract = |keyword: &str| -> Option<String> {
+                response.lines()
+                    .find(|l| l.to_lowercase().contains(keyword))
+                    .and_then(|l| l.find(':').map(|i| &l[i+1..]))
+                    .and_then(|s| parse_date(s.trim()))
+            };
+            DomainDates {
+                registered: extract("creat").or_else(|| extract("registered:")),
+                updated:    extract("updat").or_else(|| extract("last modified").or_else(|| extract("changed:"))),
+                expires:    extract("expir").or_else(|| extract("paid-till")).or_else(|| extract("renewal")),
+            }
+        };
+        Availability::Taken(dates)
+    } else if lower.contains("no match")
         || lower.contains("not found")
         || lower.contains("no entries found")
         || lower.contains("object does not exist")
@@ -202,18 +103,6 @@ async fn whois_check(name: &str, tld: &str) -> Availability {
         || lower.contains("available")
     {
         Availability::Available
-    } else if lower.contains("domain name:") || lower.contains("domain:") {
-        let extract = |keyword: &str| -> Option<String> {
-            response.lines()
-                .find(|l| l.to_lowercase().contains(keyword))
-                .and_then(|l| l.find(':').map(|i| &l[i+1..]))
-                .and_then(|s| parse_date(s.trim()))
-        };
-        Availability::Taken(DomainDates {
-            registered: extract("creat").or_else(|| extract("registered:")),
-            updated:    extract("updat").or_else(|| extract("last modified").or_else(|| extract("changed:"))),
-            expires:    extract("expir").or_else(|| extract("paid-till")).or_else(|| extract("renewal")),
-        })
     } else {
         Availability::Unknown
     }
@@ -379,24 +268,6 @@ async fn check_domain(client: Client, name: String, tld: &'static str, sem: Arc<
     );
 
     (domain, merge_results(rdap_result, whois_result, dns_result))
-}
-
-fn date_to_epoch_days(y: i64, m: i64, d: i64) -> i64 {
-    let a = (14 - m) / 12;
-    let y2 = y + 4800 - a;
-    let m2 = m + 12 * a - 3;
-    let jdn = d + (153 * m2 + 2) / 5 + 365 * y2 + y2 / 4 - y2 / 100 + y2 / 400 - 32045;
-    jdn - 2440588
-}
-
-fn days_until(date_str: &str) -> Option<i64> {
-    let p: Vec<i64> = date_str.splitn(3, '-')
-        .map(|s| s.parse().ok())
-        .collect::<Option<Vec<_>>>()?;
-    let target = date_to_epoch_days(p[0], p[1], p[2]);
-    let today = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64 / 86400;
-    Some(target - today)
 }
 
 fn print_result(domain: &str, availability: &Availability, pad: usize) {
@@ -888,7 +759,6 @@ async fn main() {
         } else {
             ALL_TLDS.to_vec()
         };
-        if !cli.plain { println!("  {} {}", "checking:".truecolor(80, 80, 100), name.bright_white()); }
         search_and_print(&client, &name, tld_list, cli.plain, None).await;
         print_update(update_check).await;
         return;
@@ -985,7 +855,6 @@ async fn main() {
                 } else {
                     input
                 };
-                println!("  {} {}", "checking:".truecolor(80, 80, 100), name.bright_white());
                 search_and_print(&client, &name, ALL_TLDS.to_vec(), false, Some(&cache)).await;
                 last_name = Some(name);
 
