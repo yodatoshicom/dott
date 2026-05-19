@@ -40,7 +40,7 @@ pub fn is_likely_premium(domain: &str) -> bool {
 }
 
 pub fn tld_price(tld: &str) -> Option<&'static str> {
-    // Registration prices from Porkbun, April 2026
+    // Registration prices from Porkbun, May 2026
     match tld {
         "com" => Some("$11.08"),
         "net" => Some("$12.52"),
@@ -48,7 +48,7 @@ pub fn tld_price(tld: &str) -> Option<&'static str> {
         "io" => Some("$51.80"),
         "dev" => Some("$12.87"),
         "app" => Some("$14.93"),
-        "co" => Some("$25.03"),
+        "co" => Some("$27.09"),
         "ai" => Some("$82.70"),
         "me" => Some("$17.27"),
         "so" => Some("€55.22"),
@@ -74,45 +74,15 @@ pub fn rdap_url(name: &str, tld: &str) -> Option<String> {
             "https://rdap.publicinterestregistry.org/rdap/domain/{}.{}",
             name, tld
         )),
-        "io" => Some(format!(
+        "io" | "ai" | "me" | "live" | "computer" | "fyi" | "work" => Some(format!(
             "https://rdap.identitydigital.services/rdap/domain/{}.{}",
             name, tld
         )),
-        "dev" => Some(format!("https://pubapi.registry.google/rdap/domain/{}.{}", name, tld)),
-        "app" => Some(format!("https://pubapi.registry.google/rdap/domain/{}.{}", name, tld)),
-        "ai" => Some(format!(
-            "https://rdap.identitydigital.services/rdap/domain/{}.{}",
-            name, tld
-        )),
-        "me" => Some(format!(
-            "https://rdap.identitydigital.services/rdap/domain/{}.{}",
-            name, tld
-        )),
-        "cc" => Some(format!(
-            "https://tld-rdap.verisign.com/cc/v1/domain/{}.{}",
-            name, tld
-        )),
-        "xyz" => Some(format!("https://rdap.centralnic.com/xyz/domain/{}.{}", name, tld)),
+        "dev" | "app" => Some(format!("https://pubapi.registry.google/rdap/domain/{}.{}", name, tld)),
+        "cc" => Some(format!("https://tld-rdap.verisign.com/cc/v1/domain/{}.{}", name, tld)),
+        "xyz" | "fm" => Some(format!("https://rdap.centralnic.com/{}/domain/{}.{}", tld, name, tld)),
         "cv" => Some(format!("https://rdap.nic.cv/domain/{}.{}", name, tld)),
-        "live" => Some(format!(
-            "https://rdap.identitydigital.services/rdap/domain/{}.{}",
-            name, tld
-        )),
-        "computer" => Some(format!(
-            "https://rdap.identitydigital.services/rdap/domain/{}.{}",
-            name, tld
-        )),
-        "fm" => Some(format!("https://rdap.centralnic.com/fm/domain/{}.{}", name, tld)),
-        "fyi" => Some(format!(
-            "https://rdap.identitydigital.services/rdap/domain/{}.{}",
-            name, tld
-        )),
-        "work" => Some(format!(
-            "https://rdap.identitydigital.services/rdap/domain/{}.{}",
-            name, tld
-        )),
-        "sh" => None, // rdap.nic.sh doesn't resolve — use WHOIS only
-        "gg" => None, // rdap.gg returns HTML — use WHOIS only
+        "sh" | "gg" => None, // RDAP endpoints don't work — use WHOIS only
         _ => Some(format!("https://rdap.org/domain/{}.{}", name, tld)),
     }
 }
