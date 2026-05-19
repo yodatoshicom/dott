@@ -147,7 +147,7 @@ async fn http_query(client: &Client, url: &str, sem: &Semaphore) -> Availability
                                         .map(|a| a == keyword)
                                         .unwrap_or(false))
                                     .and_then(|e| e["eventDate"].as_str())
-                                    .and_then(|d| parse_date(d))
+                                    .and_then(parse_date)
                             };
                             DomainDates {
                                 registered: find("registration"),
@@ -157,7 +157,7 @@ async fn http_query(client: &Client, url: &str, sem: &Semaphore) -> Availability
                                         .map(|a| a.contains("expir"))
                                         .unwrap_or(false))
                                     .and_then(|e| e["eventDate"].as_str())
-                                    .and_then(|d| parse_date(d)),
+                                    .and_then(parse_date),
                             }
                         })
                         .unwrap_or_default();
@@ -226,20 +226,18 @@ async fn check_domain_cached(
     sem: Arc<Semaphore>,
     cache: Option<Cache>,
 ) -> (String, Availability) {
-    if let Some(ref c) = cache {
-        if let Ok(map) = c.lock() {
-            if let Some((t, av)) = map.get(&(name.clone(), tld)) {
-                if t.elapsed() < CACHE_TTL {
-                    return (format!("{}.{}", name, tld), av.clone());
-                }
-            }
-        }
+    if let Some(ref c) = cache
+        && let Ok(map) = c.lock()
+        && let Some((t, av)) = map.get(&(name.clone(), tld))
+        && t.elapsed() < CACHE_TTL
+    {
+        return (format!("{}.{}", name, tld), av.clone());
     }
     let (domain, av) = check_domain(client, name.clone(), tld, sem).await;
-    if let Some(ref c) = cache {
-        if let Ok(mut map) = c.lock() {
-            map.insert((name, tld), (std::time::Instant::now(), av.clone()));
-        }
+    if let Some(ref c) = cache
+        && let Ok(mut map) = c.lock()
+    {
+        map.insert((name, tld), (std::time::Instant::now(), av.clone()));
     }
     (domain, av)
 }
@@ -377,7 +375,7 @@ fn print_cat() {
     println!("{}", format!("  |____/ \\___/ \\__|\\__|  v{}", env!("CARGO_PKG_VERSION")).truecolor(50, 215, 235));
     println!();
     println!("{}", "  private domain search..".truecolor(80, 80, 110));
-    println!("{}", "  type a name and hit enter. /help for commands.".truecolor(110, 105, 140));
+    println!("{}", "  type a name and hit enter. /help for commands · esc to quit.".truecolor(110, 105, 140));
     println!();
     println!();
 }
@@ -420,7 +418,8 @@ fn read_input(prompt: &str) -> Option<String> {
 }
 
 async fn search_and_print(client: &Client, name: &str, tld_list: Vec<&'static str>, plain: bool, cache: Option<&Cache>) {
-    let sem = Arc::new(Semaphore::new(10));
+    // One permit per TLD so the whole set can fly in parallel — no second-batch wait.
+    let sem = Arc::new(Semaphore::new(tld_list.len().max(1)));
 
     if plain {
         let tasks: Vec<_> = tld_list.iter().map(|tld| {
@@ -576,6 +575,17 @@ async fn print_update(handle: tokio::task::JoinHandle<Option<String>>) {
     }
 }
 
+async fn try_print_update_if_ready(
+    slot: &mut Option<tokio::task::JoinHandle<Option<String>>>,
+) {
+    if let Some(handle) = slot
+        && handle.is_finished()
+        && let Some(taken) = slot.take()
+    {
+        print_update(taken).await;
+    }
+}
+
 fn watchlist_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".dott").join("watchlist.json")
@@ -667,7 +677,7 @@ async fn cmd_watch(client: &Client, domain: &str) {
     if first_domain {
         send_notification("dott", &format!("Now watching {} — you'll be notified when it's available.", domain));
         println!("  {} {}", "·".truecolor(80, 80, 100), "test notification sent — if you didn't see it, allow notifications for Script Editor in:".truecolor(100, 100, 130));
-        println!("  {}  {}", " ", "System Settings → Notifications → Script Editor".bright_white());
+        println!("     {}", "System Settings → Notifications → Script Editor".bright_white());
         let _ = std::process::Command::new("open")
             .arg("x-apple.systempreferences:com.apple.preference.notifications")
             .output();
@@ -789,7 +799,8 @@ async fn main() {
         return;
     }
 
-    let update_check = tokio::spawn(check_for_update(client.clone()));
+    let mut update_check: Option<tokio::task::JoinHandle<Option<String>>> =
+        Some(tokio::spawn(check_for_update(client.clone())));
 
     // ── one-shot mode ──────────────────────────────────────────
     if let Some(keywords) = cli.suggest {
@@ -818,7 +829,7 @@ async fn main() {
             for d in &available { println!("  {}  {}", "✓".bright_green().bold(), d.bright_white().bold()); }
             println!("\n  {} available\n", available.len().to_string().bright_green().bold());
         }
-        print_update(update_check).await;
+        if let Some(h) = update_check.take() { print_update(h).await; }
         return;
     }
 
@@ -833,7 +844,7 @@ async fn main() {
             ALL_TLDS.to_vec()
         };
         search_and_print(&client, &name, tld_list, cli.plain, None).await;
-        print_update(update_check).await;
+        if let Some(h) = update_check.take() { print_update(h).await; }
         return;
     }
 
@@ -848,7 +859,7 @@ async fn main() {
         match read_input(&prompt) {
             None => {
                 println!("\n  {}\n", "bye 🐱".truecolor(180, 140, 200));
-                print_update(update_check).await;
+                if let Some(h) = update_check.take() { print_update(h).await; }
                 break;
             }
             Some(input) => {
@@ -856,7 +867,7 @@ async fn main() {
                 if input.is_empty() { continue; }
                 if input == "exit" || input == "quit" || input == "q" {
                     println!("\n  {}\n", "bye 🐱".truecolor(180, 140, 200));
-                    print_update(update_check).await;
+                    if let Some(h) = update_check.take() { print_update(h).await; }
                     break;
                 }
 
@@ -876,7 +887,7 @@ async fn main() {
                         raw.to_string()
                     };
                     println!("  {} {}", "suggesting for:".truecolor(80, 80, 100), name.bright_white());
-                    let suggestions = generate_suggestions(&[name.clone()]);
+                    let suggestions = generate_suggestions(std::slice::from_ref(&name));
                     let tlds: Vec<&'static str> = vec!["com", "io", "dev", "app", "co"];
                     let sem = Arc::new(Semaphore::new(10));
                     let tasks: Vec<_> = suggestions.iter().flat_map(|n| {
@@ -901,6 +912,7 @@ async fn main() {
                         println!();
                         println!("  {} available\n", available.len().to_string().bright_green().bold());
                     }
+                    try_print_update_if_ready(&mut update_check).await;
                     continue;
                 }
 
@@ -932,6 +944,7 @@ async fn main() {
                 last_name = Some(name);
 
                 println!();
+                try_print_update_if_ready(&mut update_check).await;
             }
         }
     }
