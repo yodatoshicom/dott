@@ -118,10 +118,12 @@ async fn dns_check(client: &Client, name: &str, tld: &str) -> Availability {
     match res {
         Ok(r) => {
             let json: serde_json::Value = r.json().await.unwrap_or_default();
+            // Status=0 alone isn't enough: some registries (e.g. .fm) return NOERROR
+            // with empty Answer for non-existent domains. Require actual NS records.
+            let has_ns = json["Answer"].as_array().is_some_and(|a| !a.is_empty());
             match json["Status"].as_i64() {
-                Some(0) => Availability::Taken(DomainDates::default()),  // has NS records = registered
-                Some(3) => Availability::Unknown, // NXDOMAIN = not registered
-                _       => Availability::Unknown,
+                Some(0) if has_ns => Availability::Taken(DomainDates::default()),
+                _ => Availability::Unknown,
             }
         }
         Err(_) => Availability::Unknown,
@@ -245,7 +247,6 @@ async fn check_domain_cached(
 async fn check_domain(client: Client, name: String, tld: &'static str, sem: Arc<Semaphore>) -> (String, Availability) {
     let domain = format!("{}.{}", name, tld);
 
-    // run RDAP, WHOIS, and DNS all in parallel
     let rdap_fut = async {
         let Some(primary) = rdap_url(&name, tld) else {
             return Availability::Unknown;
@@ -261,16 +262,29 @@ async fn check_domain(client: Client, name: String, tld: &'static str, sem: Arc<
         }
     };
 
-    let (rdap_result, whois_result, dns_result) = tokio::join!(
+    // WHOIS is the slowest source (TCP read can hang up to 8s). Spawn it cancellable
+    // and only await if RDAP couldn't give us a confident answer.
+    let whois_handle = tokio::spawn({
+        let name = name.clone();
+        async move { whois_check(&name, tld).await }
+    });
+
+    let (rdap_result, dns_result) = tokio::join!(
         rdap_fut,
-        whois_check(&name, tld),
         dns_check(&client, &name, tld)
     );
+
+    let whois_result = if matches!(rdap_result, Availability::Unknown) {
+        whois_handle.await.unwrap_or(Availability::Unknown)
+    } else {
+        whois_handle.abort();
+        Availability::Unknown
+    };
 
     (domain, merge_results(rdap_result, whois_result, dns_result))
 }
 
-fn print_result(domain: &str, availability: &Availability, pad: usize) {
+fn format_result(domain: &str, availability: &Availability, pad: usize) -> String {
     let padded = format!("{:<width$}", domain, width = pad);
     match availability {
         Availability::Available   => {
@@ -283,10 +297,10 @@ fn print_result(domain: &str, availability: &Availability, pad: usize) {
             } else {
                 String::new()
             };
-            println!("  {}  {}{}{}", "✓".bright_green().bold(), padded.bright_white().bold(), price_str, premium_str);
+            format!("  {}  {}{}{}", "✓".bright_green().bold(), padded.bright_white().bold(), price_str, premium_str)
         }
-        Availability::Protected   => println!("  {}  {}  {}", "★".bright_yellow().bold(), padded.truecolor(60, 60, 80), "brand protected".truecolor(80, 80, 100)),
-        Availability::Unknown     => println!("  {}  {}", "?".bright_yellow(), padded.truecolor(100, 100, 80)),
+        Availability::Protected   => format!("  {}  {}  {}", "★".bright_yellow().bold(), padded.truecolor(60, 60, 80), "brand protected".truecolor(80, 80, 100)),
+        Availability::Unknown     => format!("  {}  {}", "?".bright_yellow(), padded.truecolor(100, 100, 80)),
         Availability::Taken(dates) => {
             let mut info = String::new();
             if let Some(ref d) = dates.registered { info.push_str(&format!("  reg {}", d)); }
@@ -302,9 +316,9 @@ fn print_result(domain: &str, availability: &Availability, pad: usize) {
             let meta = info.truecolor(110, 100, 150).to_string()
                 + exp_str.as_deref().unwrap_or("");
             if dates.registered.is_none() && dates.updated.is_none() && dates.expires.is_none() {
-                println!("  {}  {}", "✗".truecolor(70, 70, 90), padded.truecolor(60, 60, 80));
+                format!("  {}  {}", "✗".truecolor(70, 70, 90), padded.truecolor(60, 60, 80))
             } else {
-                println!("  {}  {}{}", "✗".truecolor(70, 70, 90), padded.truecolor(60, 60, 80), meta);
+                format!("  {}  {}{}", "✗".truecolor(70, 70, 90), padded.truecolor(60, 60, 80), meta)
             }
         }
     }
@@ -407,77 +421,136 @@ fn read_input(prompt: &str) -> Option<String> {
 
 async fn search_and_print(client: &Client, name: &str, tld_list: Vec<&'static str>, plain: bool, cache: Option<&Cache>) {
     let sem = Arc::new(Semaphore::new(10));
-    let tasks: Vec<_> = tld_list.iter().map(|tld| {
-        check_domain_cached(client.clone(), name.to_string(), tld, sem.clone(), cache.cloned())
-    }).collect();
-
-    // spinner
-    let spinning = Arc::new(AtomicBool::new(true));
-    let spinner_handle = if !plain {
-        print!("\n");
-        io::stdout().flush().unwrap();
-        let spinning = spinning.clone();
-        Some(tokio::spawn(async move {
-            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            let mut i = 0usize;
-            while spinning.load(Ordering::Relaxed) {
-                print!("\r  {}", frames[i % frames.len()].truecolor(160, 120, 220));
-                io::stdout().flush().unwrap();
-                i += 1;
-                tokio::time::sleep(Duration::from_millis(80)).await;
-            }
-            print!("\r");
-            execute!(io::stdout(), Clear(ClearType::CurrentLine)).unwrap();
-        }))
-    } else {
-        None
-    };
-
-    let mut results: Vec<(String, Availability)> = join_all(tasks).await;
-
-    // stop spinner and wait for it to clear before printing results
-    if let Some(handle) = spinner_handle {
-        spinning.store(false, Ordering::Relaxed);
-        let _ = handle.await;
-    }
-
-    // sort and print all at once
-    results.sort_by(|(da, aa), (db, ab)| {
-        let is_com_a = da.ends_with(".com");
-        let is_com_b = db.ends_with(".com");
-        if is_com_a != is_com_b {
-            return is_com_b.cmp(&is_com_a);
-        }
-        let status_rank = |a: &Availability| match a {
-            Availability::Available  => 0u8,
-            Availability::Unknown    => 1,
-            Availability::Protected  => 2,
-            Availability::Taken(_)   => 3,
-        };
-        (status_rank(aa), tld_rank(da)).cmp(&(status_rank(ab), tld_rank(db)))
-    });
 
     if plain {
+        let tasks: Vec<_> = tld_list.iter().map(|tld| {
+            check_domain_cached(client.clone(), name.to_string(), tld, sem.clone(), cache.cloned())
+        }).collect();
+        let results = join_all(tasks).await;
         for (domain, av) in &results {
             println!("{} {}", domain, av.as_str());
         }
         return;
     }
 
-    let pad = results.iter().map(|(d, _)| d.len()).max().unwrap_or(0);
-    for (domain, av) in &results {
-        print_result(domain, av, pad);
+    // Pin each TLD to a fixed row (tld_rank order, so .com is always on top) and stream
+    // results into their slot as each check completes. Each pending row gets its own
+    // animated spinner; finished rows hold their result.
+    let mut tlds = tld_list;
+    tlds.sort_by_key(|t| tld_rank(t));
+    let n = tlds.len();
+    let pad = tlds.iter().map(|t| name.len() + 1 + t.len()).max().unwrap_or(0);
+
+    const FRAMES: [&str; 10] = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
+
+    println!();
+    {
+        let mut out = io::stdout();
+        for tld in &tlds {
+            let domain = format!("{}.{}", name, tld);
+            let padded = format!("{:<width$}", domain, width = pad);
+            let _ = writeln!(
+                out,
+                "  {}  {}",
+                FRAMES[0].truecolor(160, 120, 220),
+                padded.truecolor(80, 80, 100)
+            );
+        }
+        let _ = out.flush();
     }
 
-    let n = results.iter()
+    let io_lock = Arc::new(std::sync::Mutex::new(()));
+    let done: Arc<Vec<AtomicBool>> = Arc::new((0..n).map(|_| AtomicBool::new(false)).collect());
+    let spinning = Arc::new(AtomicBool::new(true));
+
+    // Tick task: every 80ms, repaint each still-pending row with the next spinner frame.
+    // Skips rows that have flipped done[i], so finished rows never flicker.
+    let tick_handle = {
+        let spinning = spinning.clone();
+        let done = done.clone();
+        let io_lock = io_lock.clone();
+        let tlds_t = tlds.clone();
+        let name_t = name.to_string();
+        tokio::spawn(async move {
+            let mut frame = 0usize;
+            while spinning.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                frame = frame.wrapping_add(1);
+                let _g = io_lock.lock().unwrap();
+                let mut out = io::stdout();
+                for (i, d) in done.iter().enumerate() {
+                    if d.load(Ordering::Relaxed) { continue; }
+                    let up = (n - i) as u16;
+                    let domain = format!("{}.{}", name_t, tlds_t[i]);
+                    let padded = format!("{:<width$}", domain, width = pad);
+                    let _ = execute!(
+                        out,
+                        cursor::MoveUp(up),
+                        cursor::MoveToColumn(0),
+                        Clear(ClearType::CurrentLine),
+                    );
+                    let _ = write!(
+                        out,
+                        "  {}  {}",
+                        FRAMES[frame % FRAMES.len()].truecolor(160, 120, 220),
+                        padded.truecolor(80, 80, 100)
+                    );
+                    let _ = execute!(out, cursor::MoveToNextLine(up));
+                }
+                let _ = out.flush();
+            }
+        })
+    };
+
+    let task_handles: Vec<_> = tlds.iter().enumerate().map(|(i, tld)| {
+        let tld = *tld;
+        let client = client.clone();
+        let name_s = name.to_string();
+        let sem = sem.clone();
+        let cache = cache.cloned();
+        let io_lock = io_lock.clone();
+        let done = done.clone();
+        tokio::spawn(async move {
+            let (domain, av) = check_domain_cached(client, name_s, tld, sem, cache).await;
+            let final_line = format_result(&domain, &av, pad);
+            {
+                let _g = io_lock.lock().unwrap();
+                let mut out = io::stdout();
+                let up = (n - i) as u16;
+                let _ = execute!(
+                    out,
+                    cursor::MoveUp(up),
+                    cursor::MoveToColumn(0),
+                    Clear(ClearType::CurrentLine),
+                );
+                let _ = write!(out, "{}", final_line);
+                let _ = execute!(out, cursor::MoveToNextLine(up));
+                let _ = out.flush();
+                done[i].store(true, Ordering::Relaxed);
+            }
+            (domain, av)
+        })
+    }).collect();
+
+    let mut results: Vec<(String, Availability)> = Vec::with_capacity(n);
+    for h in task_handles {
+        if let Ok(r) = h.await { results.push(r); }
+    }
+
+    spinning.store(false, Ordering::Relaxed);
+    let _ = tick_handle.await;
+
+    let available_count = results.iter()
         .filter(|(_, a)| matches!(a, Availability::Available))
         .count();
 
     println!();
     println!(
-        "  {} available  ·  {} checked",
-        n.to_string().bright_green().bold(),
-        results.len().to_string().truecolor(80, 80, 100)
+        "  {} available  ·  {} checked  ·  {} {}",
+        available_count.to_string().bright_green().bold(),
+        n.to_string().truecolor(80, 80, 100),
+        "/help".truecolor(140, 130, 180),
+        "for commands".truecolor(80, 80, 100)
     );
     println!();
 }
