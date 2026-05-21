@@ -1,8 +1,8 @@
 [package]
 name = "dott"
-version = "0.6.7"
+version = "0.6.8"
 edition = "2024"
-description = "Private domain availability checker. RDAP, WHOIS, and DNS — no middlemen, no tracking."
+description = "Local domain search"
 license = "MIT"
 repository = "https://github.com/yodatoshicom/dott"
 homepage = "https://github.com/yodatoshicom/dott"

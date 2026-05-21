@@ -545,13 +545,19 @@ async fn search_and_print(client: &Client, name: &str, tld_list: Vec<&'static st
 
     println!();
     println!(
-        "  {} available  ·  {} checked  ·  {} {}",
+        "  {} available  ·  {} checked",
         available_count.to_string().bright_green().bold(),
         n.to_string().truecolor(80, 80, 100),
-        "/help".truecolor(140, 130, 180),
-        "for commands".truecolor(80, 80, 100)
     );
-    println!();
+    println!("{}", "  ─────────────────────────────────────────────────────".truecolor(38, 36, 52));
+    println!(
+        "  {}  {}    {}  {}    {}  {}    {}  {}",
+        "✓".bright_green(),        "available".truecolor(70, 70, 90),
+        "?".bright_yellow(),       "unknown".truecolor(70, 70, 90),
+        "✗".truecolor(70, 70, 90), "taken".truecolor(70, 70, 90),
+        "esc".truecolor(100, 95, 130), "quit".truecolor(70, 70, 90),
+    );
+    println!("{}", "  ─────────────────────────────────────────────────────".truecolor(38, 36, 52));
 }
 
 fn installed_via_brew() -> bool {
