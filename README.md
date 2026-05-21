@@ -6,7 +6,8 @@ Domain search for the terminal. Checks RDAP, WHOIS, and DNS in parallel — **di
 
 ```sh
 # homebrew (macOS / Linux)
-brew install yodatoshicom/dott/dott
+brew tap yodatoshicom/dott https://github.com/yodatoshicom/dott
+brew install dott
 
 # or curl (downloads tarball, verifies SHA256, installs to $PATH)
 curl -fsSL https://raw.githubusercontent.com/yodatoshicom/dott/master/install.sh | sh
@@ -37,6 +38,8 @@ Sample output:
 
   2 available  ·  14 checked
 ```
+
+> `✓` available  ·  `✗` taken  ·  `?` unknown
 
 Inside interactive mode:
 
