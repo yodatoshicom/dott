@@ -81,7 +81,7 @@ Results are merged (DNS > RDAP > WHOIS priority). Expiring domains are highlight
 
 ## Supported TLDs
 
-com, net, org, io, dev, app, co, ai, me, so, gg, cc, cv, xyz
+com, net, org, io, dev, app, co, ai, me, so, gg, cc, cv, xyz, live, computer, sh, fm, fyi, work
 
 ## License
 
