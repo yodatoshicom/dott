@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "dott"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "clap",
  "colored",
@@ -1540,9 +1540,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
- "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
