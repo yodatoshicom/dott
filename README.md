@@ -4,7 +4,13 @@ Domain search for the terminal. Checks RDAP, WHOIS, and DNS in parallel — **di
 
 ## Install
 
-**macOS / Linux:**
+**Homebrew (macOS / Linux):**
+```sh
+brew tap yodatoshicom/dott https://github.com/yodatoshicom/dott
+brew install dott
+```
+
+**curl (macOS / Linux):**
 ```sh
 curl -fsSL https://raw.githubusercontent.com/yodatoshicom/dott/master/install.sh | sh
 ```
