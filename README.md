@@ -1,4 +1,6 @@
-![dott](preview.png)
+<p align="center">
+  <img src="preview.png" width="800" alt="dott">
+</p>
 
 Domain search for the terminal. Checks RDAP, WHOIS, and DNS in parallel — **directly from your machine**. No proxy API, no analytics, nothing phoning home.
 
